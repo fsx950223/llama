@@ -117,6 +117,8 @@ class Llama:
         model_args.vocab_size = tokenizer.n_words
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
         model = Transformer(model_args)
+        # reader = torch.distributed.checkpoint.FileSystemReader(checkpoint)
+        # torch.distributed.checkpoint.load_state_dict(state_dict=model.state_dict(), storage_reader=reader)
         model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
@@ -125,6 +127,17 @@ class Llama:
     def __init__(self, model: Transformer, tokenizer: Tokenizer):
         self.model = model
         self.tokenizer = tokenizer
+        self.prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=0, warmup=2, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/llama2'),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False
+        )
 
     @torch.inference_mode()
     def generate(
@@ -183,7 +196,9 @@ class Llama:
                 ignore_index=pad_id,
             )
 
+        # self.prof.start()
         for cur_pos in range(min_prompt_len, total_len):
+            # self.prof.step()
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
@@ -208,8 +223,10 @@ class Llama:
                 next_token == self.tokenizer.eos_id
             )
             prev_pos = cur_pos
+            
             if all(eos_reached):
                 break
+        # self.prof.stop()
 
         if logprobs:
             token_logprobs = token_logprobs.tolist()
@@ -229,7 +246,65 @@ class Llama:
             out_tokens.append(toks)
             out_logprobs.append(probs)
         return (out_tokens, out_logprobs if logprobs else None)
+    
+    def benchmark(
+        self,
+        prompts: List[str],
+        temperature: float = 0.6,
+        top_p: float = 0.9,
+        max_gen_len: Optional[int] = None,
+        logprobs: bool = False,
+        echo: bool = False,
+        iterations: int = 10
+    ) -> List[CompletionPrediction]:
+        """
+        Perform text completion for a list of prompts using the language generation model.
 
+        Args:
+            prompts (List[str]): List of text prompts for completion.
+            temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
+            top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
+            max_gen_len (Optional[int], optional): Maximum length of the generated completion sequence.
+                If not provided, it's set to the model's maximum sequence length minus 1.
+            logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
+            echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
+
+        Returns:
+            List[CompletionPrediction]: List of completion predictions, each containing the generated text completion.
+
+        Note:
+            This method generates text completions for the provided prompts, employing nucleus sampling to introduce controlled randomness.
+            If logprobs is True, token log probabilities are computed for each generated token.
+
+        """
+        if max_gen_len is None:
+            max_gen_len = self.model.params.max_seq_len - 1
+        prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+        self.generate(
+                prompt_tokens=prompt_tokens,
+                max_gen_len=max_gen_len,
+                temperature=temperature,
+                top_p=top_p,
+                logprobs=logprobs,
+                echo=echo,
+            )
+        start = time.perf_counter()
+        for _ in range(iterations):
+            generation_tokens, generation_logprobs = self.generate(
+                prompt_tokens=prompt_tokens,
+                max_gen_len=max_gen_len,
+                temperature=temperature,
+                top_p=top_p,
+                logprobs=logprobs,
+                echo=echo,
+            )
+        total_time = time.perf_counter() - start
+        per_iteration_time = total_time / iterations
+        tokens_count = 0
+        for t in generation_tokens:
+            tokens_count += len(t)
+        return tokens_count / per_iteration_time
+    
     def text_completion(
         self,
         prompts: List[str],
@@ -262,6 +337,7 @@ class Llama:
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
@@ -270,6 +346,7 @@ class Llama:
             logprobs=logprobs,
             echo=echo,
         )
+
         if logprobs:
             return [
                 {
